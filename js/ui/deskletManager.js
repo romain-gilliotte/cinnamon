@@ -30,6 +30,11 @@ var userDeskletsDir;
 var promises = [];
 
 var deskletChangeKey = 0;
+
+// Snapshot of the monitor layout, used to move desklets along with
+// their monitor when the layout changes
+var monitorLayout = [];
+
 const ENABLED_DESKLETS_KEY = 'enabled-desklets';
 const DESKLET_SNAP_KEY = 'desklet-snap';
 const DESKLET_SNAP_INTERVAL_KEY = 'desklet-snap-interval';
@@ -74,6 +79,9 @@ function init() {
         deskletChangeKey = global.settings.connect('changed::' + ENABLED_DESKLETS_KEY, _onEnabledDeskletsChanged);
         global.settings.connect('changed::' + DESKLET_SNAP_KEY, _onDeskletSnapChanged);
         global.settings.connect('changed::' + DESKLET_SNAP_INTERVAL_KEY, _onDeskletSnapChanged);
+
+        monitorLayout = _getMonitorLayout();
+        Main.layoutManager.connect('monitors-changed', _onMonitorsChanged);
 
         deskletsLoaded = true;
         global.log(`DeskletManager started in ${new Date().getTime() - startTime} ms`);
@@ -381,6 +389,89 @@ function _onDeskletSnapChanged(){
     global.settings.set_strv(ENABLED_DESKLETS_KEY, enabledDesklets);
     deskletChangeKey = global.settings.connect('changed::' + ENABLED_DESKLETS_KEY, _onEnabledDeskletsChanged);
     return;
+}
+
+function _getMonitorLayout() {
+    return Main.layoutManager.monitors.map(function(monitor) {
+        let {name, x, y, width, height} = monitor;
+        return {name, x, y, width, height};
+    });
+}
+
+function _findMonitorAt(layout, x, y) {
+    return layout.find(function(monitor) {
+        return x >= monitor.x && x < monitor.x + monitor.width
+            && y >= monitor.y && y < monitor.y + monitor.height;
+    });
+}
+
+// Desklet positions are absolute stage coordinates, so when monitors are
+// plugged, unplugged or rearranged, a desklet can end up on another monitor
+// or off-screen. Move each desklet so it keeps its position relative to the
+// monitor it was on, falling back to the primary monitor when that one is gone.
+function _onMonitorsChanged() {
+    let oldLayout = monitorLayout;
+    let newLayout = _getMonitorLayout();
+    monitorLayout = newLayout;
+
+    let primary = newLayout[Main.layoutManager.primaryIndex];
+    if (!primary)
+        return;
+
+    let enabledDesklets = global.settings.get_strv(ENABLED_DESKLETS_KEY);
+    let changed = false;
+
+    for (let i = 0; i < enabledDesklets.length; i++) {
+        let elements = enabledDesklets[i].split(":");
+        if (elements.length !== 4)
+            continue;
+
+        let x = parseInt(elements[2]);
+        let y = parseInt(elements[3]);
+
+        let oldMonitor = _findMonitorAt(oldLayout, x, y);
+        if (!oldMonitor)
+            continue;
+
+        // Identical monitors share the same name, so prefer one that did not move
+        let newMonitor = newLayout.find(monitor => monitor.name === oldMonitor.name
+                                                   && monitor.x === oldMonitor.x && monitor.y === oldMonitor.y)
+            || newLayout.find(monitor => monitor.name === oldMonitor.name)
+            || primary;
+        if (newMonitor.x === oldMonitor.x && newMonitor.y === oldMonitor.y
+            && newMonitor.width === oldMonitor.width && newMonitor.height === oldMonitor.height)
+            continue;
+
+        let definition = getDeskletDefinition({uuid: elements[0], desklet_id: elements[1]});
+        let actor = definition && definition.desklet ? definition.desklet.actor : null;
+        let width = actor ? actor.get_width() : 0;
+        let height = actor ? actor.get_height() : 0;
+
+        // Keep the offset from the monitor origin, but stay inside the monitor
+        // if the new one is smaller
+        let newX = newMonitor.x + Math.max(0, Math.min(x - oldMonitor.x, newMonitor.width - width));
+        let newY = newMonitor.y + Math.max(0, Math.min(y - oldMonitor.y, newMonitor.height - height));
+
+        elements[2] = newX;
+        elements[3] = newY;
+        enabledDesklets[i] = elements.join(":");
+        changed = true;
+
+        if (definition) {
+            definition.x = String(newX);
+            definition.y = String(newY);
+        }
+        if (actor)
+            actor.set_position(newX, newY);
+    }
+
+    if (!changed)
+        return;
+
+    // Desklets were moved in place, so skip _onEnabledDeskletsChanged
+    global.settings.disconnect(deskletChangeKey);
+    global.settings.set_strv(ENABLED_DESKLETS_KEY, enabledDesklets);
+    deskletChangeKey = global.settings.connect('changed::' + ENABLED_DESKLETS_KEY, _onEnabledDeskletsChanged);
 }
 
 /**
